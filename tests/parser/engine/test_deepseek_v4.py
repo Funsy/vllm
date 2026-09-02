@@ -8,7 +8,6 @@ import pytest
 
 from tests.parser.engine.conftest import make_mock_tokenizer
 from tests.parser.engine.replay_harness import (
-    DUMMY_TOOLS,
     MockTokenizer,
     _test_request,
     collect_output,
@@ -213,8 +212,10 @@ class TestImplicitParameterClose:
         chunks = [
             DSML_TOOL_START,
             f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n",
-            f"<{_PARAM_OPEN.format(name='location', is_str='true')}"
-            "Paris a<b><｜DSML｜parameter",
+            (
+                f"<{_PARAM_OPEN.format(name='location', is_str='true')}"
+                "Paris a<b><｜DSML｜parameter"
+            ),
             ' name="date" string="true">tomorrow',
             _PARAM_CLOSE,
             DSML_INVOKE_END,
@@ -264,7 +265,9 @@ class TestThinkTagAbsorption:
 
 
 class TestMissingInvokeEnd:
-    def test_non_streaming(self, mock_tokenizer, mock_request):
+    def test_non_streaming_rolls_back_incomplete_call(
+        self, mock_tokenizer, mock_request
+    ):
         parser = DeepSeekV4Parser(mock_tokenizer)
         text = (
             f"{DSML_TOOL_START}"
@@ -274,28 +277,29 @@ class TestMissingInvokeEnd:
         )
         result = parser.extract_tool_calls(text, mock_request)
 
-        assert result.tools_called is True
-        assert len(result.tool_calls) == 1
-        assert result.tool_calls[0].function.name == "get_weather"
-        args = json.loads(result.tool_calls[0].function.arguments)
-        assert args == {"location": "NYC"}
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
 
-    def test_streaming_with_trailing_content(self, mock_tokenizer, mock_request):
+    def test_streaming_rolls_back_with_trailing_content(
+        self, mock_tokenizer, mock_request
+    ):
         parser = DeepSeekV4Parser(mock_tokenizer)
         chunks = [
             DSML_TOOL_START,
-            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
-            f"{_param('location', 'true', 'NYC')}\n",
+            (
+                f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
+                f"{_param('location', 'true', 'NYC')}\n"
+            ),
             DSML_TOOL_END,
             "Done.",
         ]
 
         results = simulate_tool_streaming(parser, mock_request, chunks)
 
-        assert collect_function_name(results) == "get_weather"
-        args = json.loads(collect_tool_arguments(results))
-        assert args == {"location": "NYC"}
-        assert "Done." in collect_content(results)
+        assert collect_function_name(results) is None
+        assert collect_tool_arguments(results) == ""
+        assert collect_content(results) == "".join(chunks)
 
 
 # ── Thinking mode initial state ──────────────────────────────────────
@@ -642,6 +646,90 @@ def _content_recovery_parser(mock_tokenizer, *tools):
 
 
 class TestMalformedWrapperRecovery:
+    def test_native_wrapper_rejects_undeclared_tool_without_losing_text(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        text = _tool_calls(_recovery_invoke(name="not_declared"))
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_native_wrapper_with_runaway_name_rolls_back_as_content(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        text = (
+            DSML_TOOL_START
+            + DSML_INVOKE_PREFIX
+            + "get_weather and the rest of this answer is ordinary prose"
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_native_wrapper_rejects_malformed_parameter(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        text = (
+            f"{DSML_TOOL_START}{DSML_INVOKE_PREFIX}get_weather"
+            f"{DSML_INVOKE_NAME_END}\n"
+            "<｜DSML｜parameter broken>Seoul"
+            f"{DSML_INVOKE_END}{DSML_TOOL_END}"
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_native_wrapper_rejects_missing_required_parameter(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _make_tool("get_weather", {"city": {"type": "string"}})
+        tool.function.parameters["required"] = ["city"]
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        text = _tool_calls(_invoke("get_weather", ("country", "true", "KR")))
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_native_wrapper_implicitly_closes_last_parameter(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = _content_recovery_parser(mock_tokenizer, tool)
+        text = (
+            f"{DSML_TOOL_START}{DSML_INVOKE_PREFIX}get_weather"
+            f"{DSML_INVOKE_NAME_END}\n"
+            f"<{_PARAM_OPEN.format(name='city', is_str='true')}Seoul"
+            f"{DSML_INVOKE_END}{DSML_TOOL_END}"
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Seoul"}
+
     def test_foreign_wrapper_does_not_recover_inner_invoke(
         self, mock_tokenizer, mock_request
     ):
@@ -989,6 +1077,33 @@ class TestParallelUnwrapping:
         args1 = json.loads(extracted.tool_calls[1].function.arguments)
         assert args1 == {"timezone": "EST"}
 
+    def test_identical_raw_args_use_their_own_tool_schema(
+        self, mock_tokenizer, mock_request
+    ):
+        wrapped = _make_tool("wrapped", {"value": {"type": "integer"}})
+        literal = _make_tool(
+            "literal",
+            {
+                "arguments": {
+                    "type": "object",
+                    "properties": {"value": {"type": "integer"}},
+                }
+            },
+        )
+        tools = [wrapped, literal]
+        mock_request.tools = tools
+        parser = _content_recovery_parser(mock_tokenizer, *tools)
+        raw = ("arguments", "false", '{"value": 1}')
+        text = _tool_calls(_invoke("wrapped", raw), _invoke("literal", raw))
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert len(result.tool_calls) == 2
+        assert json.loads(result.tool_calls[0].function.arguments) == {"value": 1}
+        assert json.loads(result.tool_calls[1].function.arguments) == {
+            "arguments": {"value": 1}
+        }
+
     def test_no_unwrap_parallel_when_no_match(
         self, mock_tokenizer, mock_request, weather_tool, time_tool
     ):
@@ -1086,6 +1201,22 @@ _DSV4_FULL_VOCAB = {
     DSML_TOOL_START: 128823,
     DSML_TOOL_END: 128824,
 }
+
+_DSV4_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "units": {"type": "string"},
+                },
+            },
+        },
+    }
+]
 
 
 class _DeepSeekV4Delegating(DelegatingParser):
@@ -1187,7 +1318,7 @@ class TestDelegatingParserLargeDelta:
             dsv4_tokens,
             chunk_size=chunk_size,
             finished_on_last=True,
-            tools=DUMMY_TOOLS,
+            tools=_DSV4_TOOLS,
         )
         output = collect_output(deltas)
 
@@ -1217,7 +1348,7 @@ class TestDelegatingParserLargeDelta:
             tokens,
             chunk_size=1,
             finished_on_last=True,
-            tools=DUMMY_TOOLS,
+            tools=_DSV4_TOOLS,
             prompt_token_ids=[_DSV4_FULL_VOCAB[DSML_THINK_START]],
         )
         output = collect_output(deltas)
@@ -1282,7 +1413,7 @@ class TestDelegatingParserLargeDelta:
 
         all_ids = [t[0] for t in tokens]
         tokenizer = MockTokenizer(vocab=vocab, tokens=tokens)
-        request = _test_request(tools=DUMMY_TOOLS)
+        request = _test_request(tools=_DSV4_TOOLS)
 
         # All-in-one delta: EOS ID in token_ids but text NOT in
         # delta_text (detokenizer strips EOS).  This is the scenario
@@ -1460,8 +1591,10 @@ class TestDelegatingMalformedWrapperRecovery:
         [
             (_recovery_invoke(name="not_declared"), "auto"),
             (
-                f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
-                f"{_param('city', 'true', 'Seoul')}",
+                (
+                    f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
+                    f"{_param('city', 'true', 'Seoul')}"
+                ),
                 "auto",
             ),
             (_recovery_invoke(), "none"),

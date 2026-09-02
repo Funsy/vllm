@@ -169,6 +169,9 @@ class StreamingParserEngine:
         # transitions. It intentionally survives reset() so the owning
         # ParserEngine can bind a stable callback once at construction.
         self.recovery_tool_name_validator: Callable[[str], bool] | None = None
+        self.recovery_tool_name_prefix_validator: Callable[[str], bool] | None = None
+        self.recovery_tool_call_validator: Callable[[str, str], bool] | None = None
+        self.allow_unvalidated_wrapped_tool_call = False
         self.reset(initial_state=initial_state)
 
     @property
@@ -220,6 +223,10 @@ class StreamingParserEngine:
         self._recovery_prior_state = self.state
         self._recovery_prior_tool_index = -1
         self._recovery_outer_closer_pending = False
+        self._recovery_from_wrapper = False
+        self._recovery_raw_includes_wrapper = False
+        self._tool_preamble_raw = ""
+        self._tool_preamble_token_count = 0
 
     def feed(
         self,
@@ -480,6 +487,10 @@ class StreamingParserEngine:
     def _emit_for_state_now(
         self, text: str, token_count: int = 0
     ) -> list[SemanticEvent]:
+        if self.state == ParserState.TOOL_PREAMBLE:
+            self._tool_preamble_raw += text
+            self._tool_preamble_token_count += token_count
+            return []
         if self.state == ParserState.MESSAGE_HEADER:
             self._message_header_buffer += text
             self._message_header_token_count += token_count
@@ -518,7 +529,22 @@ class StreamingParserEngine:
             # Tool names are expected to be compact. Avoid delaying an entire
             # response if ordinary prose happens to quote an unterminated
             # invoke marker.
-            if len(self._recovery_hold_name) > 256 or "\n" in self._recovery_hold_name:
+            prefix_validator = self.recovery_tool_name_prefix_validator
+            validate_name = not (
+                self._recovery_from_wrapper and self.allow_unvalidated_wrapped_tool_call
+            )
+            invalid_prefix = (
+                validate_name
+                and prefix_validator is not None
+                and not prefix_validator(self._recovery_hold_name)
+            )
+            if (
+                len(self._recovery_hold_name) > 256
+                or "\n" in self._recovery_hold_name
+                or "\r" in self._recovery_hold_name
+                or "<" in self._recovery_hold_name
+                or invalid_prefix
+            ):
                 return self._abort_recovery_hold()
 
         self._recovery_hold_events.extend(self._emit_for_state_now(text, token_count))
@@ -558,10 +584,20 @@ class StreamingParserEngine:
         prior_state = self.state
         prior_tool_index = self.tool_index
         held_events = self._run_transition(transition, value, token_count)
+        from_preamble = prior_state == ParserState.TOOL_PREAMBLE
+        from_between = prior_state == ParserState.TOOL_BETWEEN
+        self._recovery_from_wrapper = from_preamble or from_between
+        self._recovery_raw_includes_wrapper = from_preamble
+        raw_prefix = self._tool_preamble_raw if from_preamble else ""
+        prefix_token_count = self._tool_preamble_token_count if from_preamble else 0
+        if self._recovery_from_wrapper:
+            prior_state = ParserState.CONTENT
+        self._tool_preamble_raw = ""
+        self._tool_preamble_token_count = 0
         self._recovery_hold_active = True
         self._recovery_hold_events = held_events
-        self._recovery_hold_raw = value
-        self._recovery_hold_token_count = token_count
+        self._recovery_hold_raw = raw_prefix + value
+        self._recovery_hold_token_count = prefix_token_count + token_count
         self._recovery_hold_name = ""
         self._recovery_prior_state = prior_state
         self._recovery_prior_tool_index = prior_tool_index
@@ -578,7 +614,22 @@ class StreamingParserEngine:
 
         if self.state == ParserState.TOOL_NAME:
             validator = self.recovery_tool_name_validator
-            if validator is None or not validator(self._recovery_hold_name):
+            allow_unvalidated = (
+                self._recovery_from_wrapper and self.allow_unvalidated_wrapped_tool_call
+            )
+            if not allow_unvalidated and (
+                validator is None or not validator(self._recovery_hold_name)
+            ):
+                return self._abort_recovery_hold()
+            self._recovery_hold_events.extend(
+                self._run_transition(transition, value, token_count)
+            )
+            return []
+
+        if self.state == ParserState.TOOL_PREAMBLE:
+            # A parser may start the transaction at the outer wrapper so an
+            # invalid or truncated normal call can be restored byte-for-byte.
+            if transition.next_state != ParserState.TOOL_NAME:
                 return self._abort_recovery_hold()
             self._recovery_hold_events.extend(
                 self._run_transition(transition, value, token_count)
@@ -587,6 +638,16 @@ class StreamingParserEngine:
 
         if self.state == ParserState.TOOL_ARGS:
             if not transition.commit_provisional_tool_call:
+                return self._abort_recovery_hold()
+            call_validator = self.recovery_tool_call_validator
+            raw_args = "".join(
+                event.value
+                for event in self._recovery_hold_events
+                if event.type == EventType.ARG_VALUE_CHUNK
+            )
+            if call_validator is not None and not call_validator(
+                self._recovery_hold_name, raw_args
+            ):
                 return self._abort_recovery_hold()
             if self.skip_tool_parsing:
                 raw = self._recovery_hold_raw
@@ -618,12 +679,16 @@ class StreamingParserEngine:
             transition_events = self._run_transition(transition, value, token_count)
             self._recovery_hold_events.extend(transition_events)
             events = self._recovery_hold_events
+            from_wrapper = self._recovery_from_wrapper
             self._clear_recovery_hold()
-            # A recovered invoke started outside a valid outer tool wrapper.
-            # Do not leave it in TOOL_BETWEEN: subsequent text is content, and
-            # a following bare invoke must enter the provisional path again.
-            self.state = ParserState.CONTENT
-            self._recovery_outer_closer_pending = True
+            if from_wrapper:
+                self.state = ParserState.TOOL_BETWEEN
+            else:
+                # A recovered invoke started outside a valid outer tool wrapper.
+                # Do not leave it in TOOL_BETWEEN: subsequent text is content,
+                # and a following bare invoke must enter recovery again.
+                self.state = ParserState.CONTENT
+                self._recovery_outer_closer_pending = True
             return events
 
         return self._abort_recovery_hold()
@@ -631,10 +696,14 @@ class StreamingParserEngine:
     def _abort_recovery_hold(self) -> list[SemanticEvent]:
         raw = self._recovery_hold_raw
         token_count = self._recovery_hold_token_count
-        self.state = self._recovery_prior_state
+        from_wrapper = self._recovery_from_wrapper
+        raw_includes_wrapper = self._recovery_raw_includes_wrapper
+        self.state = ParserState.CONTENT if from_wrapper else self._recovery_prior_state
         self.tool_index = self._recovery_prior_tool_index
         self._reset_args_state()
         self._clear_recovery_hold()
+        if from_wrapper and not raw_includes_wrapper:
+            self._recovery_outer_closer_pending = True
         return self._emit_for_state_now(raw, token_count)
 
     def _clear_recovery_hold(self) -> None:
@@ -643,6 +712,8 @@ class StreamingParserEngine:
         self._recovery_hold_raw = ""
         self._recovery_hold_token_count = 0
         self._recovery_hold_name = ""
+        self._recovery_from_wrapper = False
+        self._recovery_raw_includes_wrapper = False
 
     def _run_transition(
         self,
@@ -676,6 +747,13 @@ class StreamingParserEngine:
             self._message_header_token_count = 0
 
         self.state = transition.next_state
+
+        if (
+            self.state == ParserState.TOOL_PREAMBLE
+            and previous_state not in self._TOOL_STATES
+        ):
+            self._tool_preamble_raw = value
+            self._tool_preamble_token_count = token_count
 
         for event_type in transition.events:
             if event_type == EventType.TOOL_CALL_START:

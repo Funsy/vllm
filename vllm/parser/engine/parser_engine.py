@@ -409,10 +409,8 @@ class ParserEngine(Parser):
         tools = getattr(request, "tools", None)
         if tools:
             self._tools = tools
-        if not self.skip_tool_parsing and not self._suppress_tool_calls:
-            tool_choice = getattr(request, "tool_choice", None)
-            if tool_choice == "none" and tools:
-                self._suppress_tool_calls = True
+        tool_choice = getattr(request, "tool_choice", None)
+        self._suppress_tool_calls = bool(tool_choice == "none" and tools)
 
     def _strip_content_whitespace(
         self,
@@ -932,7 +930,7 @@ class ParserEngine(Parser):
 
         slot = self._tool_slots[idx]
         try:
-            current_json = converter(slot.args, True)
+            current_json = self._convert_tool_args(idx, slot.args, True)
         except (json.JSONDecodeError, ValueError, TypeError):
             logger.debug("arg converter failed (streaming): %s", slot.args[:80])
             return None
@@ -968,7 +966,7 @@ class ParserEngine(Parser):
 
         slot = self._tool_slots[idx]
         try:
-            final_json = converter(slot.args, False)
+            final_json = self._convert_tool_args(idx, slot.args, False)
         except (json.JSONDecodeError, ValueError, TypeError):
             logger.debug("arg converter failed (flush): %s", slot.args[:80])
             return None
@@ -984,6 +982,13 @@ class ParserEngine(Parser):
             slot.streamed_json = final_json
             return diff
         return None
+
+    def _convert_tool_args(self, idx: int, raw_args: str, partial: bool) -> str:
+        """Convert arguments for a specific tool-call slot."""
+        converter = self._arg_converter
+        if converter is None:
+            return raw_args
+        return converter(raw_args, partial)
 
     _NAME_RE = re.compile(r'"name"\s*:\s*"([^"]*)"')
 
@@ -1020,7 +1025,7 @@ class ParserEngine(Parser):
                 converter = self._arg_converter
                 if converter is not None:
                     try:
-                        args_json = converter(raw_body, False)
+                        args_json = self._convert_tool_args(idx, raw_body, False)
                     except (json.JSONDecodeError, ValueError, TypeError):
                         logger.debug(
                             "arg converter failed (extract): %s", raw_body[:80]

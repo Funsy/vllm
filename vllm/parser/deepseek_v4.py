@@ -32,7 +32,7 @@ from vllm.parser.engine.parser_engine_config import (
     ParserState,
     Transition,
 )
-from vllm.tool_parsers.utils import find_tool_name, find_tool_properties
+from vllm.tool_parsers.utils import find_tool_properties
 
 if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
@@ -56,7 +56,7 @@ _ESCAPED_DSML = re.escape(_DSML)
 _PARAM_RE = re.compile(
     rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
     rf"(.*?)"
-    rf"(?:</{_ESCAPED_DSML}parameter>|(?=<{_ESCAPED_DSML}parameter\s+name=))",
+    rf"(?:</{_ESCAPED_DSML}parameter>|(?=<{_ESCAPED_DSML}parameter\s+name=)|$)",
     re.DOTALL,
 )
 _PARTIAL_PARAM_RE = re.compile(
@@ -94,6 +94,20 @@ def _dsml_arg_converter(raw_args: str, partial: bool) -> str:
     return json.dumps(params, ensure_ascii=False)
 
 
+def _dsml_args_are_well_formed(raw_args: str) -> bool:
+    """Return whether every non-whitespace byte belongs to a DSML parameter."""
+    end = 0
+    found = False
+    for match in _PARAM_RE.finditer(raw_args):
+        if raw_args[end : match.start()].strip():
+            return False
+        found = True
+        end = match.end()
+    if raw_args[end:].strip():
+        return False
+    return found or not raw_args.strip()
+
+
 def _unwrap_wrapper_args(
     args_json: str,
     tools: list[Tool] | None,
@@ -123,6 +137,30 @@ def _unwrap_wrapper_args(
         if isinstance(inner, dict) and set(inner.keys()).issubset(allowed):
             return json.dumps(inner, ensure_ascii=False)
     return args_json
+
+
+def _convert_dsml_args(
+    raw_args: str,
+    partial: bool,
+    tools: list[Tool] | None,
+    func_name: str | None,
+) -> str:
+    result = _dsml_arg_converter(raw_args, partial)
+    if not tools:
+        return result
+    unwrapped = _unwrap_wrapper_args(result, tools, func_name)
+    if partial and unwrapped == result and func_name:
+        try:
+            parsed = json.loads(result)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return result
+        properties = find_tool_properties(tools, func_name)
+        for wrapper in ("arguments", "input"):
+            if set(parsed) == {wrapper} and wrapper not in properties:
+                # Do not stream a wrapper key that may disappear once its
+                # nested JSON value becomes complete and can be unwrapped.
+                return ""
+    return unwrapped
 
 
 @functools.cache
@@ -226,6 +264,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
+                provisional_tool_call=True,
             ),
             (ParserState.TOOL_NAME, "INVOKE_NAME_END"): Transition(
                 ParserState.TOOL_ARGS,
@@ -244,6 +283,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             (ParserState.TOOL_BETWEEN, "INVOKE_PREFIX"): Transition(
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
+                provisional_tool_call=True,
             ),
             (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
                 ParserState.CONTENT,
@@ -262,6 +302,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
         arg_structural_chars=frozenset(">"),
         strip_content_whitespace_with_tools=False,
         tool_args_json=False,
+        validate_tool_names=True,
     )
 
 
@@ -285,27 +326,98 @@ class DeepSeekV4Parser(ParserEngine):
             parser_engine_config=deepseek_v4_config(thinking=thinking),
             **kwargs,
         )
-        self._arg_converter = self._convert_args
         self._recovery_request_tools: list[Tool] = list(tools or [])
         self._recovery_suppressed = False
         self._engine.recovery_tool_name_validator = self._can_recover_tool_name
+        self._engine.recovery_tool_name_prefix_validator = (
+            self._can_recover_tool_name_prefix
+        )
+        self._engine.recovery_tool_call_validator = self._can_recover_tool_call
+        self._engine.allow_unvalidated_wrapped_tool_call = (
+            not self._recovery_request_tools
+        )
 
     def _check_skip_tool_parsing(self, request) -> None:
         super()._check_skip_tool_parsing(request)
-        self._recovery_request_tools = list(getattr(request, "tools", None) or [])
-        self._recovery_suppressed = getattr(request, "tool_choice", None) == "none"
+        request_tools = getattr(request, "tools", None)
+        if request_tools is not None:
+            self._recovery_request_tools = list(request_tools)
+        else:
+            self._recovery_request_tools = list(self._tools or [])
+        self._recovery_suppressed = self._suppress_tool_calls
+        self._engine.allow_unvalidated_wrapped_tool_call = bool(
+            not self._recovery_request_tools or self._recovery_suppressed
+        )
 
     def _can_recover_tool_name(self, name: str) -> bool:
         return bool(
             name
             and self._recovery_request_tools
             and not self._recovery_suppressed
-            and find_tool_name(self._recovery_request_tools, name)
+            and name in self._declared_tool_names()
         )
 
-    def _convert_args(self, raw_args: str, partial: bool) -> str:
-        result = _dsml_arg_converter(raw_args, partial)
-        if not self._tools:
-            return result
-        func_name = next((s.name for s in self._tool_slots if s.args == raw_args), None)
-        return _unwrap_wrapper_args(result, self._tools, func_name)
+    @staticmethod
+    def _tool_name_and_parameters(tool: Tool) -> tuple[str | None, object]:
+        if isinstance(tool, dict):
+            function = tool.get("function")
+            if isinstance(function, dict):
+                return function.get("name"), function.get("parameters")
+            return tool.get("name"), tool.get("parameters")
+        function = getattr(tool, "function", None)
+        name = getattr(function, "name", None) or getattr(tool, "name", None)
+        parameters = getattr(function, "parameters", None) or getattr(
+            tool, "parameters", None
+        )
+        return name, parameters
+
+    def _declared_tool_names(self) -> list[str]:
+        names: list[str] = []
+        for tool in self._recovery_request_tools:
+            name, _ = self._tool_name_and_parameters(tool)
+            if isinstance(name, str):
+                names.append(name)
+        return names
+
+    def _can_recover_tool_name_prefix(self, prefix: str) -> bool:
+        return bool(
+            not self._recovery_suppressed
+            and len(prefix) <= 256
+            and any(name.startswith(prefix) for name in self._declared_tool_names())
+        )
+
+    def _required_tool_params(self, name: str) -> set[str]:
+        for tool in self._recovery_request_tools:
+            tool_name, parameters = self._tool_name_and_parameters(tool)
+            if tool_name != name:
+                continue
+            if isinstance(parameters, dict):
+                required = parameters.get("required", [])
+                if isinstance(required, list):
+                    return {item for item in required if isinstance(item, str)}
+            break
+        return set()
+
+    def _can_recover_tool_call(self, name: str, raw_args: str) -> bool:
+        if not _dsml_args_are_well_formed(raw_args):
+            return False
+        try:
+            parsed = json.loads(_dsml_arg_converter(raw_args, partial=False))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        result = _unwrap_wrapper_args(
+            json.dumps(parsed, ensure_ascii=False),
+            self._recovery_request_tools,
+            name,
+        )
+        try:
+            parsed = json.loads(result)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return False
+        return self._required_tool_params(name).issubset(parsed)
+
+    def _convert_tool_args(self, idx: int, raw_args: str, partial: bool) -> str:
+        func_name = self._tool_slots[idx].name if idx < len(self._tool_slots) else None
+        return _convert_dsml_args(raw_args, partial, self._tools, func_name)

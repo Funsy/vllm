@@ -27,8 +27,8 @@ from vllm.parser.deepseek_v4 import (
     DSML_INVOKE_PREFIX,
     DSML_PARAM_CLOSE,
     DSML_PARAM_START,
+    _convert_dsml_args,
     _dsml_arg_converter,
-    _unwrap_wrapper_args,
 )
 from vllm.parser.engine.events import EventType
 from vllm.parser.engine.parser_engine import ParserEngine
@@ -123,11 +123,7 @@ class DeepSeekV32Parser(ParserEngine):
             parser_engine_config=deepseek_v32_config(),
             **kwargs,
         )
-        self._arg_converter = self._convert_args
 
-    def _convert_args(self, raw_args: str, partial: bool) -> str:
-        result = _dsml_arg_converter(raw_args, partial)
-        if not self._tools:
-            return result
-        func_name = next((s.name for s in self._tool_slots if s.args == raw_args), None)
-        return _unwrap_wrapper_args(result, self._tools, func_name)
+    def _convert_tool_args(self, idx: int, raw_args: str, partial: bool) -> str:
+        func_name = self._tool_slots[idx].name if idx < len(self._tool_slots) else None
+        return _convert_dsml_args(raw_args, partial, self._tools, func_name)
